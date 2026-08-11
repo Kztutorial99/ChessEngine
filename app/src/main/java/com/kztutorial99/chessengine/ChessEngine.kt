@@ -314,6 +314,20 @@ class ChessEngine {
     @Volatile
     var stopRequested = false
 
+    /**
+     * EXTREME ANALYZE THINK.
+     * When on, the engine stops playing "classical" positional chess: every weight
+     * that has to do with hunting the enemy king is multiplied, the forced-mate
+     * solver digs far deeper, and moves that only create a mate THREAT are still
+     * rewarded. Material is treated as ammunition - sacrifices that shrink the
+     * enemy king's box are preferred over safe, slow moves.
+     */
+    @Volatile
+    var extreme = false
+
+    private val aggro: Int get() = if (extreme) 4 else 1
+
+
     private var nodes = 0L
 
     private val values = mapOf('P' to 100, 'N' to 320, 'B' to 335, 'R' to 500, 'Q' to 950, 'K' to 0)
@@ -384,14 +398,20 @@ class ChessEngine {
             val v = base + pst
             if (white) { score += v; whiteMaterial += base } else { score -= v; blackMaterial += base }
         }
-        // mate-hunting: reward crowding the enemy king when ahead
-        score += kingPressure(p, true, blackMaterial)
-        score -= kingPressure(p, false, whiteMaterial)
-        if (Rules.inCheck(p, false)) score += 60
-        if (Rules.inCheck(p, true)) score -= 60
+        // mate-hunting: reward crowding the enemy king (x4 in EXTREME mode)
+        score += kingPressure(p, true, blackMaterial) * aggro
+        score -= kingPressure(p, false, whiteMaterial) * aggro
+        if (Rules.inCheck(p, false)) score += 60 * aggro
+        if (Rules.inCheck(p, true)) score -= 60 * aggro
         // mating net: the fewer squares the enemy king has, the better
-        score += (8 - kingEscapeSquares(p, false)) * 22
-        score -= (8 - kingEscapeSquares(p, true)) * 22
+        score += (8 - kingEscapeSquares(p, false)) * 22 * aggro
+        score -= (8 - kingEscapeSquares(p, true)) * 22 * aggro
+        if (extreme) {
+            // shield-busting: every missing pawn in front of the enemy king is blood in the water
+            score += kingShieldDamage(p, false) * 25
+            score -= kingShieldDamage(p, true) * 25
+        }
+
         return if (p.whiteToMove) score else -score
     }
 
@@ -414,6 +434,25 @@ class ChessEngine {
         }
         return free
     }
+
+    /** How broken the pawn shield in front of a king is (0 = intact, 3 = fully stripped). */
+    private fun kingShieldDamage(p: Position, white: Boolean): Int {
+        val k = Rules.kingSquare(p, white)
+        if (k < 0) return 0
+        val kr = k / 8
+        val kc = k % 8
+        val d = if (white) -1 else 1
+        val pawn = if (white) 'P' else 'p'
+        var missing = 0
+        for (dc in -1..1) {
+            val c = kc + dc
+            val r = kr + d
+            if (c !in 0..7 || r !in 0..7) { missing++; continue }
+            if (p.sq[r * 8 + c] != pawn) missing++
+        }
+        return missing
+    }
+
 
     private fun kingPressure(p: Position, attackerWhite: Boolean, defenderMaterial: Int): Int {
         val k = Rules.kingSquare(p, !attackerWhite)
@@ -455,10 +494,24 @@ class ChessEngine {
             val replies = Rules.legalMoves(n).size
             if (replies == 0) return 1_000_000            // mate now
             s += (24 - replies.coerceAtMost(24)) * 250    // the more forcing, the better
+            if (extreme) {
+                // EXTREME: a check that also cages the king outranks any capture
+                s += (8 - kingEscapeSquares(n, !p.whiteToMove)) * 600
+                if (replies <= 2) s += 12_000             // near-forced: hunt it first
+            }
         } else {
             // quiet moves that still shrink the enemy king's box
-            s += (8 - kingEscapeSquares(n, !p.whiteToMove)) * 40
+            s += (8 - kingEscapeSquares(n, !p.whiteToMove)) * (if (extreme) 220 else 40)
+            if (extreme) {
+                // reward pieces stepping INTO the enemy king zone, even as a sacrifice
+                val k = Rules.kingSquare(n, !p.whiteToMove)
+                if (k >= 0) {
+                    val dist = maxOf(abs(m.to / 8 - k / 8), abs(m.to % 8 - k % 8))
+                    if (dist <= 2) s += (3 - dist) * 700
+                }
+            }
         }
+
         if (ply in killers.indices) {
             if (killers[ply][0] == m) s += 2500
             else if (killers[ply][1] == m) s += 1800
@@ -589,8 +642,27 @@ class ChessEngine {
     }
 
     /**
+     * How dangerous a move is as a *mate threat*: the share of enemy replies that
+     * still run into a short forced mate. 100 = every defence loses by force.
+     */
+    private fun mateThreat(p: Position, m: Move, plies: Int): Int {
+        val n = Rules.make(p, m)
+        val replies = Rules.legalMoves(n)
+        if (replies.isEmpty()) return if (Rules.inCheck(n, n.whiteToMove)) 1000 else 0
+        var losing = 0
+        for (r in replies) {
+            if (stopRequested) return 0
+            if (findForcedMate(Rules.make(n, r), plies) != null) losing++
+        }
+        return losing * 100 / replies.size
+    }
+
+    /**
      * Iterative deepening. [onInfo] fires after every completed depth so the UI can
      * show live analysis; the search aborts when [stopRequested] flips to true.
+     *
+     * In EXTREME mode the mate solver runs much deeper, the search goes two plies
+     * further, and quiet moves are re-ranked by how strong a mate threat they create.
      */
     fun analyze(position: Position, maxDepth: Int = 6, timeLimitMs: Long = 8000, onInfo: ((Info) -> Unit)? = null): Info {
         stopRequested = false
@@ -602,8 +674,9 @@ class ChessEngine {
         val root = position.copy()
         if (Rules.legalMoves(root).isEmpty()) return bestInfo
 
-        // Phase 1 - prove a forced mate with the checks-only solver (mate in 1..4).
-        findForcedMate(root, 7)?.let { line ->
+        // Phase 1 - prove a forced mate with the checks-only solver.
+        // Classic: mate in 1..4. EXTREME: mate in 1..7, proven and forced.
+        findForcedMate(root, if (extreme) 13 else 7)?.let { line ->
             val mateIn = (line.size + 1) / 2
             bestInfo = Info(line.firstOrNull(), line, MATE - line.size, line.size, mateIn, nodes)
             onInfo?.invoke(bestInfo)
@@ -611,7 +684,8 @@ class ChessEngine {
         }
         if (stopRequested) return bestInfo
 
-        for (depth in 1..maxDepth) {
+        val topDepth = if (extreme) maxDepth + 2 else maxDepth
+        for (depth in 1..topDepth) {
             val pv = ArrayList<Move>()
             val score = search(root, depth, -MATE * 2, MATE * 2, 0, pv)
             if (stopRequested) break
@@ -625,8 +699,29 @@ class ChessEngine {
             if (mateIn != null && mateIn > 0) break
             if (System.currentTimeMillis() - start > timeLimitMs) break
         }
+
+        // Phase 3 (EXTREME only) - no mate yet, so pick the move that puts the
+        // enemy king under the heaviest unavoidable mating pressure.
+        if (extreme && !stopRequested && bestInfo.mateIn == null) {
+            val candidates = Rules.legalMoves(root)
+                .sortedByDescending { moveScore(root, it) }
+                .take(6)
+            var bestMove = bestInfo.best
+            var bestThreat = bestInfo.best?.let { mateThreat(root, it, 5) } ?: -1
+            for (m in candidates) {
+                if (stopRequested) break
+                if (System.currentTimeMillis() - start > timeLimitMs * 2) break
+                val t = mateThreat(root, m, 5)
+                if (t > bestThreat) { bestThreat = t; bestMove = m }
+            }
+            if (bestThreat > 0 && bestMove != null && bestMove != bestInfo.best) {
+                bestInfo = Info(bestMove, listOf(bestMove), bestInfo.score + bestThreat * 10, bestInfo.depth, null, nodes)
+                onInfo?.invoke(bestInfo)
+            }
+        }
         return bestInfo
     }
+
 
     fun stop() { stopRequested = true }
 }
