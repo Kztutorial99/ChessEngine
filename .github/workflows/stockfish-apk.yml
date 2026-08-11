@@ -24,7 +24,11 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install Android NDK r27c
-        run: sdkmanager "ndk;27.2.12479018"
+        run: |
+          sdkmanager "ndk;27.2.12479018"
+          NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -35,8 +39,6 @@ jobs:
         run: git clone --depth 1 https://github.com/official-stockfish/Stockfish.git stockfish-src
 
       - name: Build Stockfish arm64-v8a
-        env:
-          PATH: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin:${{ env.PATH }}
         run: |
           cd stockfish-src/src
           make -j2 build ARCH=armv8 COMP=ndk
@@ -45,8 +47,6 @@ jobs:
           chmod 755 ../../app/src/main/assets/stockfish/arm64-v8a/stockfish
 
       - name: Build Stockfish armeabi-v7a
-        env:
-          PATH: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin:${{ env.PATH }}
         run: |
           cd stockfish-src/src
           make clean
