@@ -316,17 +316,17 @@ class ChessEngine {
 
     /**
      * EXTREME ANALYZE THINK.
-     * When on, the engine stops playing "classical" positional chess: every weight
-     * that has to do with hunting the enemy king is multiplied, the forced-mate
-     * solver digs far deeper, and moves that only create a mate THREAT are still
-     * rewarded. Material is treated as ammunition - sacrifices that shrink the
-     * enemy king's box are preferred over safe, slow moves.
+     * Not "random aggression": the engine still verifies every idea with a real
+     * search + static exchange evaluation, so it never throws material away for
+     * free. What EXTREME changes is the *priority*: deeper search, deeper forced
+     * mate proving, and bigger bonuses for sound attacking play (king box,
+     * shattered pawn shield, pieces aimed at the enemy king).
      */
     @Volatile
     var extreme = false
 
-    private val aggro: Int get() = if (extreme) 4 else 1
-
+    /** Attack weight multiplier. Kept modest so material stays real. */
+    private val aggro: Int get() = if (extreme) 2 else 1
 
     private var nodes = 0L
 
@@ -335,7 +335,8 @@ class ChessEngine {
     var deadlineMs: Long = Long.MAX_VALUE
     private fun timeUp() = System.currentTimeMillis() >= deadlineMs
 
-    private val values = mapOf('P' to 100, 'N' to 320, 'B' to 335, 'R' to 500, 'Q' to 950, 'K' to 0)
+    private val values = mapOf('P' to 100, 'N' to 325, 'B' to 340, 'R' to 500, 'Q' to 960, 'K' to 0)
+    private fun pieceValue(c: Char): Int = if (c == '.') 0 else (values[c.uppercaseChar()] ?: 0)
 
     private val pawnPst = intArrayOf(
         0, 0, 0, 0, 0, 0, 0, 0,
@@ -367,6 +368,26 @@ class ChessEngine {
         -10, 5, 0, 0, 0, 0, 5, -10,
         -20, -10, -10, -10, -10, -10, -10, -20,
     )
+    private val rookPst = intArrayOf(
+        0, 0, 0, 0, 0, 0, 0, 0,
+        5, 10, 10, 10, 10, 10, 10, 5,
+        -5, 0, 0, 0, 0, 0, 0, -5,
+        -5, 0, 0, 0, 0, 0, 0, -5,
+        -5, 0, 0, 0, 0, 0, 0, -5,
+        -5, 0, 0, 0, 0, 0, 0, -5,
+        -5, 0, 0, 0, 0, 0, 0, -5,
+        0, 0, 5, 10, 10, 5, 0, 0,
+    )
+    private val queenPst = intArrayOf(
+        -20, -10, -10, -5, -5, -10, -10, -20,
+        -10, 0, 0, 0, 0, 0, 0, -10,
+        -10, 0, 5, 5, 5, 5, 0, -10,
+        -5, 0, 5, 5, 5, 5, 0, -5,
+        0, 0, 5, 5, 5, 5, 0, -5,
+        -10, 5, 5, 5, 5, 5, 0, -10,
+        -10, 0, 5, 0, 0, 0, 0, -10,
+        -20, -10, -10, -5, -5, -10, -10, -20,
+    )
     private val kingPst = intArrayOf(
         -30, -40, -40, -50, -50, -40, -40, -30,
         -30, -40, -40, -50, -50, -40, -40, -30,
@@ -377,14 +398,43 @@ class ChessEngine {
         20, 20, 0, 0, 0, 0, 20, 20,
         20, 30, 10, 0, 0, 10, 30, 20,
     )
+    private val kingEndPst = intArrayOf(
+        -50, -40, -30, -20, -20, -30, -40, -50,
+        -30, -20, -10, 0, 0, -10, -20, -30,
+        -30, -10, 20, 30, 30, 20, -10, -30,
+        -30, -10, 30, 40, 40, 30, -10, -30,
+        -30, -10, 30, 40, 40, 30, -10, -30,
+        -30, -10, 20, 30, 30, 20, -10, -30,
+        -30, -30, 0, 0, 0, 0, -30, -30,
+        -50, -30, -30, -30, -30, -30, -30, -50,
+    )
 
     private val MATE = 100_000
+
+    // ---------------------------------------------------------------- evaluation
 
     /** Positive = good for the side to move. */
     fun evaluate(p: Position): Int {
         var score = 0
         var whiteMaterial = 0
         var blackMaterial = 0
+        var whiteBishops = 0
+        var blackBishops = 0
+        val whitePawnFiles = IntArray(8)
+        val blackPawnFiles = IntArray(8)
+
+        for (i in 0..63) {
+            val piece = p.sq[i]
+            if (piece == '.') continue
+            val white = piece.isUpperCase()
+            val type = piece.uppercaseChar()
+            if (type == 'P') { if (white) whitePawnFiles[i % 8]++ else blackPawnFiles[i % 8]++ }
+            if (type == 'B') { if (white) whiteBishops++ else blackBishops++ }
+            val base = values[type] ?: 0
+            if (white) whiteMaterial += base else blackMaterial += base
+        }
+        val endgame = (whiteMaterial + blackMaterial) < 2600
+
         for (i in 0..63) {
             val piece = p.sq[i]
             if (piece == '.') continue
@@ -396,28 +446,69 @@ class ChessEngine {
                 'P' -> pawnPst[mirrored]
                 'N' -> knightPst[mirrored]
                 'B' -> bishopPst[mirrored]
-                'R' -> 0
-                'Q' -> 0
-                else -> kingPst[mirrored]
+                'R' -> rookPst[mirrored]
+                'Q' -> queenPst[mirrored]
+                else -> if (endgame) kingEndPst[mirrored] else kingPst[mirrored]
             }
-            val v = base + pst
-            if (white) { score += v; whiteMaterial += base } else { score -= v; blackMaterial += base }
-        }
-        // mate-hunting: reward crowding the enemy king (x4 in EXTREME mode)
-        score += kingPressure(p, true, blackMaterial) * aggro
-        score -= kingPressure(p, false, whiteMaterial) * aggro
-        if (Rules.inCheck(p, false)) score += 60 * aggro
-        if (Rules.inCheck(p, true)) score -= 60 * aggro
-        // mating net: the fewer squares the enemy king has, the better
-        score += (8 - kingEscapeSquares(p, false)) * 22 * aggro
-        score -= (8 - kingEscapeSquares(p, true)) * 22 * aggro
-        if (extreme) {
-            // shield-busting: every missing pawn in front of the enemy king is blood in the water
-            score += kingShieldDamage(p, false) * 25
-            score -= kingShieldDamage(p, true) * 25
+            var v = base + pst
+            if (type == 'P') {
+                val file = i % 8
+                val own = if (white) whitePawnFiles else blackPawnFiles
+                val foe = if (white) blackPawnFiles else whitePawnFiles
+                if (own[file] > 1) v -= 14                                   // doubled
+                val left = if (file > 0) own[file - 1] else 0
+                val right = if (file < 7) own[file + 1] else 0
+                if (left == 0 && right == 0) v -= 16                          // isolated
+                val fl = if (file > 0) foe[file - 1] else 0
+                val fr = if (file < 7) foe[file + 1] else 0
+                if (foe[file] == 0 && fl == 0 && fr == 0) {                   // passed
+                    val rank = if (white) 7 - i / 8 else i / 8
+                    v += 12 + rank * rank * 4
+                }
+            }
+            if (type == 'R') {
+                val file = i % 8
+                if (whitePawnFiles[file] == 0 && blackPawnFiles[file] == 0) v += 18
+                else if ((if (white) whitePawnFiles else blackPawnFiles)[file] == 0) v += 9
+            }
+            if (white) score += v else score -= v
         }
 
+        if (whiteBishops >= 2) score += 32
+        if (blackBishops >= 2) score -= 32
+
+        // mobility: a piece that cannot move is a piece that does not exist
+        score += (Rules.pseudoMoves(p, true).size - Rules.pseudoMoves(p, false).size) * 3
+
+        // king hunting (sound version: bonuses, never a licence to give material away)
+        score += kingPressure(p, true, blackMaterial) * aggro
+        score -= kingPressure(p, false, whiteMaterial) * aggro
+        if (Rules.inCheck(p, false)) score += 25 * aggro
+        if (Rules.inCheck(p, true)) score -= 25 * aggro
+        score += (8 - kingEscapeSquares(p, false)) * 10 * aggro
+        score -= (8 - kingEscapeSquares(p, true)) * 10 * aggro
+        score += kingShieldDamage(p, false) * 12 * aggro
+        score -= kingShieldDamage(p, true) * 12 * aggro
+
+        // hanging material: this is what stops "free food" moves
+        score += hangingPenalty(p, false) - hangingPenalty(p, true)
+
         return if (p.whiteToMove) score else -score
+    }
+
+    /** Sum of undefended / under-defended pieces of [white] that the enemy can win. */
+    private fun hangingPenalty(p: Position, white: Boolean): Int {
+        var worst = 0
+        for (i in 0..63) {
+            val piece = p.sq[i]
+            if (piece == '.' || piece.isUpperCase() != white) continue
+            if (piece.uppercaseChar() == 'K') continue
+            if (!Rules.isAttacked(p, i, !white)) continue
+            val loss = if (!Rules.isAttacked(p, i, white)) pieceValue(piece) else pieceValue(piece) / 6
+            if (loss > worst) worst = loss
+        }
+        // only the biggest threat counts - the side to move can usually save one piece
+        return worst / 2
     }
 
     /** Free squares around a king that are not attacked - the core of the mating net. */
@@ -458,70 +549,167 @@ class ChessEngine {
         return missing
     }
 
-
     private fun kingPressure(p: Position, attackerWhite: Boolean, defenderMaterial: Int): Int {
         val k = Rules.kingSquare(p, !attackerWhite)
         if (k < 0) return 0
         val kr = k / 8
         val kc = k % 8
         var bonus = 0
+        var attackers = 0
         for (i in 0..63) {
             val piece = p.sq[i]
             if (piece == '.' || piece.isUpperCase() != attackerWhite) continue
             val t = piece.uppercaseChar()
             if (t == 'P' || t == 'K') continue
             val dist = maxOf(abs(i / 8 - kr), abs(i % 8 - kc))
-            bonus += (7 - dist) * 3
+            if (dist <= 3) { attackers++; bonus += (4 - dist) * 6 }
         }
+        // a real attack needs several attackers - one lonely queen is not an attack
+        if (attackers >= 2) bonus += attackers * attackers * 8
         // push the lone enemy king to the edge in endgames
         if (defenderMaterial < 500) {
-            bonus += (abs(3.5 - kc) + abs(3.5 - kr)).toInt() * 8
+            bonus += ((abs(3.5 - kc) + abs(3.5 - kr)) * 8).toInt()
         }
         return bonus
     }
 
-    private val killers = Array(96) { arrayOfNulls<Move>(2) }
+    // ------------------------------------------------- static exchange evaluation
+
+    /** Cheapest attacker of [target] for [byWhite] on a raw board, or -1. */
+    private fun leastValuableAttacker(b: CharArray, target: Int, byWhite: Boolean): Int {
+        val r = target / 8
+        val c = target % 8
+        var best = -1
+        var bestVal = Int.MAX_VALUE
+        fun consider(i: Int) {
+            val v = pieceValue(b[i])
+            val w = if (b[i].uppercaseChar() == 'K') 10_000 else v
+            if (w < bestVal) { bestVal = w; best = i }
+        }
+        val pd = if (byWhite) 1 else -1
+        for (dc in intArrayOf(-1, 1)) {
+            val ar = r + pd; val ac = c + dc
+            if (ar in 0..7 && ac in 0..7 && b[ar * 8 + ac] == (if (byWhite) 'P' else 'p')) consider(ar * 8 + ac)
+        }
+        for ((dr, dc) in arrayOf(2 to 1, 2 to -1, -2 to 1, -2 to -1, 1 to 2, 1 to -2, -1 to 2, -1 to -2)) {
+            val ar = r + dr; val ac = c + dc
+            if (ar !in 0..7 || ac !in 0..7) continue
+            val q = b[ar * 8 + ac]
+            if (q != '.' && q.uppercaseChar() == 'N' && q.isUpperCase() == byWhite) consider(ar * 8 + ac)
+        }
+        for (dr in -1..1) for (dc in -1..1) {
+            if (dr == 0 && dc == 0) continue
+            val ar = r + dr; val ac = c + dc
+            if (ar !in 0..7 || ac !in 0..7) continue
+            val q = b[ar * 8 + ac]
+            if (q != '.' && q.uppercaseChar() == 'K' && q.isUpperCase() == byWhite) consider(ar * 8 + ac)
+        }
+        val diag = arrayOf(1 to 1, 1 to -1, -1 to 1, -1 to -1)
+        val orth = arrayOf(1 to 0, -1 to 0, 0 to 1, 0 to -1)
+        for ((dirs, pieces) in listOf(diag to "BQ", orth to "RQ")) {
+            for ((dr, dc) in dirs) {
+                var ar = r + dr; var ac = c + dc
+                while (ar in 0..7 && ac in 0..7) {
+                    val q = b[ar * 8 + ac]
+                    if (q != '.') {
+                        if (q.isUpperCase() == byWhite && pieces.contains(q.uppercaseChar())) consider(ar * 8 + ac)
+                        break
+                    }
+                    ar += dr; ac += dc
+                }
+            }
+        }
+        return best
+    }
+
+    /**
+     * Static exchange evaluation: material won/lost if the whole capture sequence
+     * on [m].to is played out. Negative = the move simply hands material over.
+     * This single function is what stops the engine from feeding the opponent.
+     */
+    fun see(p: Position, m: Move): Int {
+        val b = p.sq.copyOf()
+        val mover = b[m.from]
+        if (mover == '.') return 0
+        var side = mover.isUpperCase()
+        val gain = IntArray(34)
+        gain[0] = if (m.flag == 1) 100 else pieceValue(b[m.to])
+        if (m.promotion != null) gain[0] += pieceValue(m.promotion!!) - 100
+        var attackerVal = if (m.promotion != null) pieceValue(m.promotion!!) else pieceValue(mover)
+        b[m.to] = m.promotion ?: mover
+        b[m.from] = '.'
+        if (m.flag == 1) b[if (side) m.to + 8 else m.to - 8] = '.'
+        side = !side
+        var d = 0
+        while (d < 30) {
+            val from = leastValuableAttacker(b, m.to, side)
+            if (from < 0) break
+            d++
+            gain[d] = attackerVal - gain[d - 1]
+            attackerVal = pieceValue(b[from])
+            b[m.to] = b[from]
+            b[from] = '.'
+            side = !side
+            if (gain[d] < 0 && gain[d - 1] < 0) break
+        }
+        while (d > 0) {
+            gain[d - 1] = -maxOf(-gain[d - 1], gain[d])
+            d--
+        }
+        return gain[0]
+    }
+
+    // ------------------------------------------------------------ move ordering
+
+    private val killers = Array(128) { arrayOfNulls<Move>(2) }
     private val history = HashMap<Int, Int>()
 
     private fun keyOf(m: Move) = m.from * 64 + m.to
 
-    private fun moveScore(p: Position, m: Move, ply: Int = 0): Int {
+    private fun moveScore(p: Position, m: Move, ply: Int = 0, ttMove: Move? = null): Int {
+        if (ttMove != null && m.from == ttMove.from && m.to == ttMove.to && m.promotion == ttMove.promotion) {
+            return 2_000_000
+        }
         var s = 0
         val victim = p.sq[m.to]
-        val attacker = p.sq[m.from]
-        if (victim != '.') s += 4000 + (values[victim.uppercaseChar()] ?: 0) - (values[attacker.uppercaseChar()] ?: 0) / 10
-        if (m.promotion != null) s += 3500
-        if (m.flag == 1) s += 4000
-        // forcing moves first: this is what makes short mates pop out of the search
+        val capture = victim != '.' || m.flag == 1
+        if (capture || m.promotion != null) {
+            val exch = see(p, m)
+            s += if (exch >= 0) 100_000 + exch * 10 else -60_000 + exch * 5
+        }
+        if (m.promotion != null) s += 8_000
+
         val n = Rules.make(p, m)
-        if (Rules.inCheck(n, n.whiteToMove)) {
-            s += 9000
+        val givesCheck = Rules.inCheck(n, n.whiteToMove)
+        if (givesCheck) {
+            val exch = see(p, m)
             val replies = Rules.legalMoves(n).size
-            if (replies == 0) return 1_000_000            // mate now
-            s += (24 - replies.coerceAtMost(24)) * 250    // the more forcing, the better
-            if (extreme) {
-                // EXTREME: a check that also cages the king outranks any capture
-                s += (8 - kingEscapeSquares(n, !p.whiteToMove)) * 600
-                if (replies <= 2) s += 12_000             // near-forced: hunt it first
+            if (replies == 0) return 3_000_000                     // mate now
+            // A check is only "forcing" if it does not just donate a piece.
+            val sound = exch >= 0 || replies <= 2
+            if (sound) {
+                s += 40_000
+                s += (24 - replies.coerceAtMost(24)) * 400
+                if (extreme) s += (8 - kingEscapeSquares(n, !p.whiteToMove)) * 500
+            } else {
+                s += 2_000 + exch * 4                              // speculative, try late
             }
-        } else {
-            // quiet moves that still shrink the enemy king's box
-            s += (8 - kingEscapeSquares(n, !p.whiteToMove)) * (if (extreme) 220 else 40)
+        } else if (!capture) {
+            // quiet moves: box the enemy king in, but never above sound material
+            s += (8 - kingEscapeSquares(n, !p.whiteToMove)) * (if (extreme) 60 else 20)
             if (extreme) {
-                // reward pieces stepping INTO the enemy king zone, even as a sacrifice
                 val k = Rules.kingSquare(n, !p.whiteToMove)
                 if (k >= 0) {
                     val dist = maxOf(abs(m.to / 8 - k / 8), abs(m.to % 8 - k % 8))
-                    if (dist <= 2) s += (3 - dist) * 700
+                    if (dist <= 2 && see(p, m) >= 0) s += (3 - dist) * 120
                 }
             }
+            if (ply in killers.indices) {
+                if (killers[ply][0] == m) s += 9_000
+                else if (killers[ply][1] == m) s += 7_000
+            }
+            s += (history[keyOf(m)] ?: 0).coerceAtMost(6_000)
         }
-
-        if (ply in killers.indices) {
-            if (killers[ply][0] == m) s += 2500
-            else if (killers[ply][1] == m) s += 1800
-        }
-        s += history[keyOf(m)] ?: 0
         return s
     }
 
@@ -534,11 +722,12 @@ class ChessEngine {
         history[keyOf(m)] = (history[keyOf(m)] ?: 0) + depth * depth
     }
 
+    // ------------------------------------------------------------- mate solver
+
     /**
      * Dedicated forced-mate solver. The attacker is allowed ONLY checks (or an
-     * immediate mate); the defender may answer with everything. That makes the
-     * tree tiny, so mates far deeper than the normal search can find are proven
-     * in milliseconds - and the line returned is always forced.
+     * immediate mate); the defender may answer with everything. The line returned
+     * is always forced - never a guess.
      */
     fun findForcedMate(p: Position, maxPlies: Int): List<Move>? {
         for (plies in 1..maxPlies step 2) {
@@ -554,11 +743,10 @@ class ChessEngine {
         nodes++
         val moves = Rules.legalMoves(p).sortedByDescending { moveScore(p, it) }
         for (m in moves) {
-            if (stopRequested) return false
+            if (stopRequested || timeUp()) return false
             val n = Rules.make(p, m)
-            val givesCheck = Rules.inCheck(n, n.whiteToMove)
-            if (!givesCheck) continue                       // only forcing tries
-            if (Rules.legalMoves(n).isEmpty()) {            // checkmate
+            if (!Rules.inCheck(n, n.whiteToMove)) continue          // only forcing tries
+            if (Rules.legalMoves(n).isEmpty()) {                    // checkmate
                 out.clear(); out.add(m); return true
             }
             if (plies == 1) continue
@@ -586,16 +774,26 @@ class ChessEngine {
         return true
     }
 
+    // ------------------------------------------------------------------ search
+
+    private class TTEntry(val depth: Int, val score: Int, val flag: Int, val move: Move?)
+
+    private val tt = HashMap<String, TTEntry>()
+
     private fun quiesce(p: Position, alpha0: Int, beta: Int, ply: Int): Int {
         nodes++
+        if (stopRequested || timeUp()) return evaluate(p)
         var alpha = alpha0
         val stand = evaluate(p)
         if (stand >= beta) return beta
         if (stand > alpha) alpha = stand
-        val caps = Rules.legalMoves(p).filter { p.sq[it.to] != '.' || it.promotion != null || it.flag == 1 }
+        if (ply > 32) return alpha
+
+        val caps = Rules.legalMoves(p)
+            .filter { (p.sq[it.to] != '.' || it.promotion != null || it.flag == 1) && see(p, it) >= 0 }
             .sortedByDescending { moveScore(p, it) }
         for (m in caps) {
-            if (stopRequested) return alpha
+            if (stopRequested || timeUp()) return alpha
             val score = -quiesce(Rules.make(p, m), -beta, -alpha, ply + 1)
             if (score >= beta) return beta
             if (score > alpha) alpha = score
@@ -611,8 +809,7 @@ class ChessEngine {
             return if (Rules.inCheck(p, p.whiteToMove)) -MATE + ply else 0
         }
         val inCheckHere = Rules.inCheck(p, p.whiteToMove)
-        // check extension: never stop searching in the middle of a forcing sequence
-        val d = if (inCheckHere) depth + 1 else depth
+        val d = if (inCheckHere) depth + 1 else depth          // check extension
         if (d <= 0) return quiesce(p, alpha0, beta, ply)
 
         // mate-distance pruning: always prefer the FASTEST mate
@@ -620,60 +817,72 @@ class ChessEngine {
         val hiBeta = minOf(beta, MATE - ply - 1)
         if (alpha >= hiBeta) return alpha
 
-        val ordered = moves.sortedByDescending { moveScore(p, it, ply) }
+        val key = p.toFen()
+        var ttMove: Move? = null
+        tt[key]?.let { e ->
+            ttMove = e.move
+            if (e.depth >= d && ply > 0) {
+                when (e.flag) {
+                    0 -> return e.score
+                    1 -> if (e.score >= hiBeta) return e.score
+                    2 -> if (e.score <= alpha) return e.score
+                }
+            }
+        }
+
+        val ordered = moves.sortedByDescending { moveScore(p, it, ply, ttMove) }
         var localPv: List<Move> = emptyList()
+        var bestMove: Move? = null
+        var raisedAlpha = false
+
         for ((idx, m) in ordered.withIndex()) {
             val childPv = ArrayList<Move>()
             val n = Rules.make(p, m)
-            val forcing = Rules.inCheck(n, n.whiteToMove) || p.sq[m.to] != '.' || m.promotion != null
-            // late-move reduction on quiet moves keeps the search laser-focused on forcing play
-            val nextDepth = if (!forcing && !inCheckHere && idx >= 6 && d >= 3) d - 2 else d - 1
+            val capture = p.sq[m.to] != '.' || m.flag == 1
+            val givesCheck = Rules.inCheck(n, n.whiteToMove)
+            val forcing = givesCheck || capture || m.promotion != null
+
+            // never search a move that just gives material away at full depth
+            val losing = (capture || givesCheck) && see(p, m) < 0
+            var nextDepth = d - 1
+            if (!forcing && !inCheckHere && idx >= 4 && d >= 3) nextDepth = d - 2
+            if (losing && !inCheckHere && d >= 3) nextDepth = minOf(nextDepth, d - 2)
+
             var score = -search(n, nextDepth, -hiBeta, -alpha, ply + 1, childPv)
-            if (score > alpha && nextDepth < d - 1) {
+            if (score > alpha && nextDepth < d - 1 && !stopRequested && !timeUp()) {
                 childPv.clear()
                 score = -search(n, d - 1, -hiBeta, -alpha, ply + 1, childPv)
             }
-            if (stopRequested) break
+            if (stopRequested || timeUp()) break
             if (score >= hiBeta) {
-                if (p.sq[m.to] == '.' && m.promotion == null) storeKiller(ply, m, d)
+                if (!capture && m.promotion == null) storeKiller(ply, m, d)
+                tt[key] = TTEntry(d, hiBeta, 1, m)
                 return hiBeta
             }
             if (score > alpha) {
                 alpha = score
+                raisedAlpha = true
+                bestMove = m
                 localPv = listOf(m) + childPv
             }
         }
         if (localPv.isNotEmpty()) { pvOut.clear(); pvOut.addAll(localPv) }
+        if (!stopRequested && !timeUp()) {
+            tt[key] = TTEntry(d, alpha, if (raisedAlpha) 0 else 2, bestMove)
+        }
         return alpha
     }
 
     /**
-     * How dangerous a move is as a *mate threat*: the share of enemy replies that
-     * still run into a short forced mate. 100 = every defence loses by force.
+     * Iterative deepening. [onInfo] fires after every COMPLETED depth, so the arrow
+     * on the board is always a fully analysed move - never a quick guess and never
+     * a random move. Partial (timed-out) iterations are discarded.
      */
-    private fun mateThreat(p: Position, m: Move, plies: Int): Int {
-        val n = Rules.make(p, m)
-        val replies = Rules.legalMoves(n)
-        if (replies.isEmpty()) return if (Rules.inCheck(n, n.whiteToMove)) 1000 else 0
-        var losing = 0
-        for (r in replies) {
-            if (stopRequested) return 0
-            if (findForcedMate(Rules.make(n, r), plies) != null) losing++
-        }
-        return losing * 100 / replies.size
-    }
-
-    /**
-     * Iterative deepening. [onInfo] fires after every completed depth so the UI can
-     * show live analysis; the search aborts when [stopRequested] flips to true.
-     *
-     * In EXTREME mode the mate solver runs much deeper, the search goes two plies
-     * further, and quiet moves are re-ranked by how strong a mate threat they create.
-     */
-    fun analyze(position: Position, maxDepth: Int = 6, timeLimitMs: Long = 8000, onInfo: ((Info) -> Unit)? = null): Info {
+    fun analyze(position: Position, maxDepth: Int = 8, timeLimitMs: Long = 8000, onInfo: ((Info) -> Unit)? = null): Info {
         stopRequested = false
         nodes = 0
         history.clear()
+        tt.clear()
         for (k in killers.indices) { killers[k][0] = null; killers[k][1] = null }
         val start = System.currentTimeMillis()
         deadlineMs = start + timeLimitMs
@@ -681,66 +890,59 @@ class ChessEngine {
         val root = position.copy()
         val rootMoves = Rules.legalMoves(root)
         if (rootMoves.isEmpty()) return bestInfo
+        if (rootMoves.size == 1) {
+            bestInfo = Info(rootMoves[0], rootMoves, 0, 1, null, nodes)
+            onInfo?.invoke(bestInfo)
+            deadlineMs = Long.MAX_VALUE
+            return bestInfo
+        }
 
-        // Instant suggestion: the board must ALWAYS show one arrow, even while the
-        // deep mate hunt is still thinking. This is what removes the "stuck, no
-        // arrow" feeling on slow positions.
-        val quick = rootMoves.maxByOrNull { moveScore(root, it) } ?: rootMoves.first()
-        bestInfo = Info(quick, listOf(quick), 0, 1, null, nodes)
-        onInfo?.invoke(bestInfo)
-
-        // Phase 1 - prove the FASTEST forced mate with the checks-only solver.
-        // It gets a slice of the budget so the normal search always gets a turn.
-        val mateBudget = start + (timeLimitMs * 6 / 10).coerceAtLeast(200L)
+        // Phase 1 - short forced-mate probe (cheap, always correct when it hits).
+        val mateBudget = start + (timeLimitMs / 4).coerceAtLeast(150L)
         deadlineMs = mateBudget
-        val mateLine = findForcedMate(root, if (extreme) 13 else 7)
+        var mateLine = findForcedMate(root, if (extreme) 7 else 5)
         deadlineMs = start + timeLimitMs
         if (mateLine != null) {
             val mateIn = (mateLine.size + 1) / 2
             bestInfo = Info(mateLine.firstOrNull(), mateLine, MATE - mateLine.size, mateLine.size, mateIn, nodes)
             onInfo?.invoke(bestInfo)
+            deadlineMs = Long.MAX_VALUE
             return bestInfo
         }
         if (stopRequested) return bestInfo
 
-        val topDepth = if (extreme) maxDepth + 2 else maxDepth
+        // Phase 2 - full iterative deepening search. Only completed depths count.
+        val topDepth = if (extreme) maxDepth + 4 else maxDepth
         for (depth in 1..topDepth) {
-            if (timeUp()) break
+            if (stopRequested || timeUp()) break
             val pv = ArrayList<Move>()
             val score = search(root, depth, -MATE * 2, MATE * 2, 0, pv)
             if (stopRequested) break
+            if (timeUp() && bestInfo.best != null) break      // discard partial iteration
             if (pv.isEmpty()) break
             val mateIn = if (abs(score) > MATE - 200) {
                 val plies = MATE - abs(score)
-                val moves = (plies + 1) / 2
-                if (score > 0) moves else -moves
+                val movesToMate = (plies + 1) / 2
+                if (score > 0) movesToMate else -movesToMate
             } else null
             bestInfo = Info(pv.firstOrNull(), pv.toList(), score, depth, mateIn, nodes)
             onInfo?.invoke(bestInfo)
             if (mateIn != null && mateIn > 0) break
-            if (timeUp()) break
         }
 
-        // Phase 3 (EXTREME only) - no proven mate yet, so pick the move that puts
-        // the enemy king under the heaviest unavoidable mating pressure.
-        if (extreme && !stopRequested && bestInfo.mateIn == null && !timeUp()) {
-            val candidates = rootMoves.sortedByDescending { moveScore(root, it) }.take(6)
-            var bestMove = bestInfo.best
-            var bestThreat = bestInfo.best?.let { mateThreat(root, it, 5) } ?: -1
-            for (m in candidates) {
-                if (stopRequested || timeUp()) break
-                val t = mateThreat(root, m, 5)
-                if (t > bestThreat) { bestThreat = t; bestMove = m }
-            }
-            if (bestThreat > 0 && bestMove != null && bestMove != bestInfo.best) {
-                bestInfo = Info(bestMove, listOf(bestMove), bestInfo.score + bestThreat * 10, bestInfo.depth, null, nodes)
+        // Phase 3 - deep forced-mate confirmation with whatever time is left.
+        if (bestInfo.mateIn == null && !stopRequested && !timeUp()) {
+            mateLine = findForcedMate(root, if (extreme) 11 else 7)
+            if (mateLine != null && mateLine.isNotEmpty()) {
+                val mateIn = (mateLine.size + 1) / 2
+                bestInfo = Info(mateLine.first(), mateLine, MATE - mateLine.size, mateLine.size, mateIn, nodes)
                 onInfo?.invoke(bestInfo)
             }
         }
+
         deadlineMs = Long.MAX_VALUE
         return bestInfo
     }
-
 
     fun stop() { stopRequested = true; deadlineMs = 0 }
 }
