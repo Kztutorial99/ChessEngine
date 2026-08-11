@@ -1,0 +1,72 @@
+name: ChessEngine APK + Stockfish
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK r27c
+        run: sdkmanager "ndk;27.2.12479018"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Fetch Stockfish source
+        run: git clone --depth 1 https://github.com/official-stockfish/Stockfish.git stockfish-src
+
+      - name: Build Stockfish arm64-v8a
+        env:
+          PATH: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin:${{ env.PATH }}
+        run: |
+          cd stockfish-src/src
+          make -j2 build ARCH=armv8 COMP=ndk
+          mkdir -p ../../app/src/main/assets/stockfish/arm64-v8a
+          cp stockfish ../../app/src/main/assets/stockfish/arm64-v8a/stockfish
+          chmod 755 ../../app/src/main/assets/stockfish/arm64-v8a/stockfish
+
+      - name: Build Stockfish armeabi-v7a
+        env:
+          PATH: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin:${{ env.PATH }}
+        run: |
+          cd stockfish-src/src
+          make clean
+          make -j2 build ARCH=armv7-neon COMP=ndk
+          mkdir -p ../../app/src/main/assets/stockfish/armeabi-v7a
+          cp stockfish ../../app/src/main/assets/stockfish/armeabi-v7a/stockfish
+          chmod 755 ../../app/src/main/assets/stockfish/armeabi-v7a/stockfish
+
+      - name: Verify Stockfish binaries
+        run: |
+          file app/src/main/assets/stockfish/arm64-v8a/stockfish
+          file app/src/main/assets/stockfish/armeabi-v7a/stockfish
+          test -s app/src/main/assets/stockfish/arm64-v8a/stockfish
+          test -s app/src/main/assets/stockfish/armeabi-v7a/stockfish
+
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessEngine-Stockfish-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
