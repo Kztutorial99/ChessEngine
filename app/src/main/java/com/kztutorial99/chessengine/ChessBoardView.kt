@@ -18,6 +18,36 @@ class ChessBoardView(context: Context) : View(context) {
     var position = Position().apply { setStart() }
         private set
 
+    /** true = black at the bottom (you are playing black). */
+    var flipped = false
+        set(value) { field = value; invalidate() }
+
+    private val undoStack = ArrayList<Pair<Position, Move?>>()
+
+    /** board index -> on-screen index (and back: the mapping is its own inverse). */
+    private fun dsp(i: Int) = if (flipped) 63 - i else i
+
+    val canUndo: Boolean get() = undoStack.isNotEmpty()
+
+    /** Takes back one ply. Returns false when there is nothing to take back. */
+    fun undo(): Boolean {
+        val prev = undoStack.removeLastOrNull() ?: return false
+        position = prev.first
+        lastMove = prev.second
+        selected = -1
+        legalForSelected = emptyList()
+        dragging = false
+        hint = null
+        hintPv = emptyList()
+        pendingPromotion = null
+        invalidate()
+        listener?.onPositionChanged(position)
+        return true
+    }
+
+    /** Plays a move programmatically (used by the engine when it is its turn). */
+    fun playMove(m: Move) = applyMove(m)
+
     private var selected = -1
     private var legalForSelected: List<Move> = emptyList()
     private var lastMove: Move? = null
@@ -55,6 +85,7 @@ class ChessBoardView(context: Context) : View(context) {
         hint = null
         hintPv = emptyList()
         pendingPromotion = null
+        undoStack.clear()
         invalidate()
         listener?.onPositionChanged(position)
     }
@@ -83,13 +114,14 @@ class ChessBoardView(context: Context) : View(context) {
 
         lastMove?.let {
             paint.color = Color.argb(70, 255, 235, 90)
-            for (idx in intArrayOf(it.from, it.to)) {
+            for (raw in intArrayOf(it.from, it.to)) {
+                val idx = dsp(raw)
                 canvas.drawRect(left + (idx % 8) * sq, top + (idx / 8) * sq, left + (idx % 8 + 1) * sq, top + (idx / 8 + 1) * sq, paint)
             }
         }
 
         if (Rules.inCheck(position, position.whiteToMove)) {
-            val k = Rules.kingSquare(position, position.whiteToMove)
+            val k = Rules.kingSquare(position, position.whiteToMove).let { if (it >= 0) dsp(it) else it }
             if (k >= 0) {
                 paint.color = Color.argb(120, 220, 50, 50)
                 canvas.drawRect(left + (k % 8) * sq, top + (k / 8) * sq, left + (k % 8 + 1) * sq, top + (k / 8 + 1) * sq, paint)
@@ -97,13 +129,15 @@ class ChessBoardView(context: Context) : View(context) {
         }
 
         if (selected >= 0) {
+            val d = dsp(selected)
             paint.color = Color.argb(110, 255, 220, 60)
-            canvas.drawRect(left + (selected % 8) * sq, top + (selected / 8) * sq, left + (selected % 8 + 1) * sq, top + (selected / 8 + 1) * sq, paint)
+            canvas.drawRect(left + (d % 8) * sq, top + (d / 8) * sq, left + (d % 8 + 1) * sq, top + (d / 8 + 1) * sq, paint)
         }
 
         for (m in legalForSelected.distinctBy { it.to }) {
-            val cx = left + (m.to % 8 + .5f) * sq
-            val cy = top + (m.to / 8 + .5f) * sq
+            val dTo = dsp(m.to)
+            val cx = left + (dTo % 8 + .5f) * sq
+            val cy = top + (dTo / 8 + .5f) * sq
             if (position.sq[m.to] != '.' || m.flag == 1) {
                 paint.color = Color.argb(120, 20, 90, 20)
                 paint.style = Paint.Style.STROKE
@@ -120,14 +154,14 @@ class ChessBoardView(context: Context) : View(context) {
         for (i in 0..63) {
             if (position.sq[i] == '.') continue
             if (dragging && i == selected) continue
-            drawPiece(canvas, position.sq[i], left + (i % 8 + .5f) * sq, top + (i / 8 + .5f) * sq, sq)
+            drawPiece(canvas, position.sq[i], left + (dsp(i) % 8 + .5f) * sq, top + (dsp(i) / 8 + .5f) * sq, sq)
         }
         if (dragging && selected >= 0) drawPiece(canvas, position.sq[selected], dragX, dragY, sq)
 
         // engine arrows: main line strong, follow-up faded
-        hint?.let { drawArrow(canvas, left, top, sq, it.from, it.to, Color.argb(225, 40, 190, 90), sq * .11f) }
+        hint?.let { drawArrow(canvas, left, top, sq, dsp(it.from), dsp(it.to), Color.argb(225, 40, 190, 90), sq * .11f) }
         if (hintPv.size > 1) {
-            drawArrow(canvas, left, top, sq, hintPv[1].from, hintPv[1].to, Color.argb(120, 90, 160, 255), sq * .07f)
+            drawArrow(canvas, left, top, sq, dsp(hintPv[1].from), dsp(hintPv[1].to), Color.argb(120, 90, 160, 255), sq * .07f)
         }
 
         pendingPromotion?.let { drawPromotionPicker(canvas, left, top, sq, it) }
@@ -171,8 +205,8 @@ class ChessBoardView(context: Context) : View(context) {
 
     private fun drawPromotionPicker(canvas: Canvas, l: Float, t: Float, s: Float, m: Move) {
         val white = position.sq[m.from].isUpperCase()
-        val col = m.to % 8
-        val topRow = if (white) 0 else 4
+        val col = dsp(m.to) % 8
+        val topRow = if (dsp(m.to) / 8 == 0) 0 else 4
         paint.color = Color.argb(235, 30, 33, 40)
         canvas.drawRect(l + col * s, t + topRow * s, l + (col + 1) * s, t + (topRow + 4) * s, paint)
         promotionChoices(white).forEachIndexed { i, ch ->
@@ -180,11 +214,12 @@ class ChessBoardView(context: Context) : View(context) {
         }
     }
 
-    private fun handlePromotionTap(idx: Int): Boolean {
+    private fun handlePromotionTap(screenIdx: Int): Boolean {
         val m = pendingPromotion ?: return false
         val white = position.sq[m.from].isUpperCase()
-        val col = m.to % 8
-        val topRow = if (white) 0 else 4
+        val idx = screenIdx
+        val col = dsp(m.to) % 8
+        val topRow = if (dsp(m.to) / 8 == 0) 0 else 4
         if (idx % 8 != col || idx / 8 !in topRow..(topRow + 3)) {
             pendingPromotion = null
             invalidate()
@@ -197,6 +232,7 @@ class ChessBoardView(context: Context) : View(context) {
     }
 
     private fun applyMove(m: Move) {
+        undoStack.add(position.copy() to lastMove)
         position = Rules.make(position, m)
         lastMove = m
         selected = -1
@@ -214,10 +250,11 @@ class ChessBoardView(context: Context) : View(context) {
         if (e.x < l || e.x > l + size || e.y < t || e.y > t + size) return true
         val c = ((e.x - l) / s).toInt().coerceIn(0, 7)
         val r = ((e.y - t) / s).toInt().coerceIn(0, 7)
-        val idx = r * 8 + c
+        val screenIdx = r * 8 + c
+        val idx = dsp(screenIdx)
 
         if (pendingPromotion != null) {
-            if (e.action == MotionEvent.ACTION_UP) handlePromotionTap(idx)
+            if (e.action == MotionEvent.ACTION_UP) handlePromotionTap(screenIdx)
             return true
         }
 
