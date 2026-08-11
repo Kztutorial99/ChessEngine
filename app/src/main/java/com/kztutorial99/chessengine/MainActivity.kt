@@ -102,7 +102,7 @@ class MainActivity : Activity(), ChessBoardView.Listener {
         }
         undoBtn = styledButton("\u21A9 Undo", Color.rgb(150, 90, 40)) { undoMove() }
         sideBtn = styledButton("Play: White", Color.rgb(60, 72, 96)) { switchSide() }
-        extremeBtn = styledButton("\u26A1 Extreme: Off", Color.rgb(52, 58, 70)) { toggleExtreme() }
+        extremeBtn = styledButton("\u26A1 Normal", Color.rgb(52, 58, 70)) { toggleExtreme() }
         controls2.addView(undoBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
         controls2.addView(sideBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
         controls2.addView(extremeBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
@@ -126,7 +126,9 @@ class MainActivity : Activity(), ChessBoardView.Listener {
         Button(this).apply {
             text = label
             isAllCaps = false
-            textSize = 15f
+            textSize = 13f
+            setPadding(dp(4), 0, dp(4), 0)
+            maxLines = 1
             setTextColor(Color.WHITE)
             background = GradientDrawable().apply {
                 cornerRadius = dp(12).toFloat()
@@ -176,7 +178,7 @@ class MainActivity : Activity(), ChessBoardView.Listener {
     private fun toggleExtreme() {
         extremeMode = !extremeMode
         engine.extreme = extremeMode
-        extremeBtn.text = if (extremeMode) "\u26A1 EXTREME ON" else "\u26A1 Extreme: Off"
+        extremeBtn.text = if (extremeMode) "\u26A1 EXTREME" else "\u26A1 Normal"
         extremeBtn.background = (extremeBtn.background as GradientDrawable).apply {
             setColor(if (extremeMode) Color.rgb(190, 40, 45) else Color.rgb(52, 58, 70))
         }
