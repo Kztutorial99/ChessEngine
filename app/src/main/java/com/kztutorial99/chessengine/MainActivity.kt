@@ -23,15 +23,14 @@ class MainActivity : Activity(), ChessBoardView.Listener {
     private lateinit var analyzeBtn: Button
     private lateinit var sideBtn: Button
     private lateinit var undoBtn: Button
-    private lateinit var engineBtn: Button
+    private lateinit var extremeBtn: Button
 
     private val engine = ChessEngine()
     private val ui = Handler(Looper.getMainLooper())
     private var worker: Thread? = null
     private var liveAnalysis = false
     private var playerWhite = true
-    private var engineOpponent = false
-    private var engineThinking = false
+    private var extremeMode = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -84,7 +83,6 @@ class MainActivity : Activity(), ChessBoardView.Listener {
         val reset = styledButton("Reset", Color.rgb(52, 58, 70)) {
             stopAnalysis()
             liveAnalysis = false
-            engineThinking = false
             analyzeBtn.text = "Analyze"
             board.reset()
         }
@@ -99,10 +97,10 @@ class MainActivity : Activity(), ChessBoardView.Listener {
         }
         undoBtn = styledButton("\u21A9 Undo", Color.rgb(150, 90, 40)) { undoMove() }
         sideBtn = styledButton("Play: White", Color.rgb(60, 72, 96)) { switchSide() }
-        engineBtn = styledButton("Engine: Off", Color.rgb(52, 58, 70)) { toggleEngineOpponent() }
+        extremeBtn = styledButton("\u26A1 Extreme: Off", Color.rgb(52, 58, 70)) { toggleExtreme() }
         controls2.addView(undoBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
         controls2.addView(sideBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
-        controls2.addView(engineBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
+        controls2.addView(extremeBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
 
         root.addView(title, LinearLayout.LayoutParams(-1, -2))
         root.addView(boardHolder, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -139,47 +137,32 @@ class MainActivity : Activity(), ChessBoardView.Listener {
         board.flipped = !playerWhite
         sideBtn.text = if (playerWhite) "Play: White" else "Play: Black"
         updateStatus()
-        if (liveAnalysis) startAnalysis() else maybeEngineMove()
+        if (liveAnalysis) startAnalysis()
     }
 
     /** Takes back your move (plus the engine's reply when the engine is playing). */
     private fun undoMove() {
         stopAnalysis()
-        engineThinking = false
         if (!board.undo()) return
-        if (engineOpponent) board.undo()
         updateStatus()
         if (liveAnalysis) startAnalysis()
     }
 
-    private fun toggleEngineOpponent() {
-        engineOpponent = !engineOpponent
-        engineBtn.text = if (engineOpponent) "Engine: On" else "Engine: Off"
-        engineBtn.background = (engineBtn.background as GradientDrawable).apply {
-            setColor(if (engineOpponent) Color.rgb(160, 50, 60) else Color.rgb(52, 58, 70))
+    /**
+     * EXTREME ANALYZE THINK.
+     * Off = classical analysis (material + position).
+     * On  = the engine only cares about one thing: hunting the enemy king. It
+     *       proves deep forced mates, prefers checks, sacrifices and mating nets
+     *       over safe material, and reports the fastest mate it can force.
+     */
+    private fun toggleExtreme() {
+        extremeMode = !extremeMode
+        engine.extreme = extremeMode
+        extremeBtn.text = if (extremeMode) "\u26A1 EXTREME ON" else "\u26A1 Extreme: Off"
+        extremeBtn.background = (extremeBtn.background as GradientDrawable).apply {
+            setColor(if (extremeMode) Color.rgb(190, 40, 45) else Color.rgb(52, 58, 70))
         }
-        if (engineOpponent) maybeEngineMove()
-    }
-
-    /** Lets the engine answer when it is its turn. It always plays the most forcing line. */
-    private fun maybeEngineMove() {
-        if (!engineOpponent || engineThinking || liveAnalysis) return
-        val p = board.position
-        if (p.whiteToMove == playerWhite) return
-        if (Rules.legalMoves(p).isEmpty()) return
-        engineThinking = true
-        status.text = "Engine thinking\u2026"
-        val snapshot = p.copy()
-        worker = Thread {
-            val info = engine.analyze(snapshot, maxDepth = 5, timeLimitMs = 4000)
-            ui.post {
-                engineThinking = false
-                val best = info.best
-                if (best != null && board.position.toFen() == snapshot.toFen()) {
-                    board.playMove(best)
-                } else updateStatus()
-            }
-        }.also { it.isDaemon = true; it.start() }
+        if (liveAnalysis) startAnalysis() else updateStatus()
     }
 
     // --- analysis -------------------------------------------------------------
@@ -210,9 +193,11 @@ class MainActivity : Activity(), ChessBoardView.Listener {
         val snapshot = board.position.copy()
         if (Rules.legalMoves(snapshot).isEmpty()) { updateStatus(); return }
         val mover = if (snapshot.whiteToMove) "White" else "Black"
-        status.text = "Analyzing for $mover\u2026"
+        status.text = if (extremeMode) "\u26A1 EXTREME mate hunt for $mover\u2026" else "Analyzing for $mover\u2026"
+        val depth = if (extremeMode) 7 else 5
+        val budget = if (extremeMode) 15000L else 6000L
         worker = Thread {
-            engine.analyze(snapshot, maxDepth = 5, timeLimitMs = 6000) { info ->
+            engine.analyze(snapshot, maxDepth = depth, timeLimitMs = budget) { info ->
                 ui.post {
                     if (!liveAnalysis) return@post
                     board.setHint(info.best, info.pv)
@@ -227,7 +212,8 @@ class MainActivity : Activity(), ChessBoardView.Listener {
         val evalText = info.mateIn?.let {
             if (it > 0) "mate in $it" else "mated in ${-it}"
         } ?: "%+.2f".format(info.score / 100.0)
-        status.text = "$mover to move \u2022 best ${Rules.sanLike(snapshot, best)} \u2022 $evalText \u2022 d${info.depth}"
+        val tag = if (extremeMode) "\u26A1 " else ""
+        status.text = "$tag$mover to move \u2022 best ${Rules.sanLike(snapshot, best)} \u2022 $evalText \u2022 d${info.depth}"
         val pvText = buildString {
             var p = snapshot.copy()
             for (m in info.pv.take(6)) {
@@ -243,10 +229,7 @@ class MainActivity : Activity(), ChessBoardView.Listener {
     override fun onPositionChanged(position: Position) {
         updateStatus()
         undoBtn.isEnabled = board.canUndo
-        if (liveAnalysis) startAnalysis() else {
-            line.text = ""
-            maybeEngineMove()
-        }
+        if (liveAnalysis) startAnalysis() else line.text = ""
     }
 
     private fun updateStatus() {
