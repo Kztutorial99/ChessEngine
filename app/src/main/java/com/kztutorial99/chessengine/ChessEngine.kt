@@ -387,9 +387,32 @@ class ChessEngine {
         // mate-hunting: reward crowding the enemy king when ahead
         score += kingPressure(p, true, blackMaterial)
         score -= kingPressure(p, false, whiteMaterial)
-        if (Rules.inCheck(p, false)) score += 25
-        if (Rules.inCheck(p, true)) score -= 25
+        if (Rules.inCheck(p, false)) score += 60
+        if (Rules.inCheck(p, true)) score -= 60
+        // mating net: the fewer squares the enemy king has, the better
+        score += (8 - kingEscapeSquares(p, false)) * 22
+        score -= (8 - kingEscapeSquares(p, true)) * 22
         return if (p.whiteToMove) score else -score
+    }
+
+    /** Free squares around a king that are not attacked - the core of the mating net. */
+    fun kingEscapeSquares(p: Position, white: Boolean): Int {
+        val k = Rules.kingSquare(p, white)
+        if (k < 0) return 8
+        val kr = k / 8
+        val kc = k % 8
+        var free = 0
+        for (dr in -1..1) for (dc in -1..1) {
+            if (dr == 0 && dc == 0) continue
+            val r = kr + dr
+            val c = kc + dc
+            if (r !in 0..7 || c !in 0..7) continue
+            val t = r * 8 + c
+            val q = p.sq[t]
+            if (q != '.' && q.isUpperCase() == white) continue
+            if (!Rules.isAttacked(p, t, !white)) free++
+        }
+        return free
     }
 
     private fun kingPressure(p: Position, attackerWhite: Boolean, defenderMaterial: Int): Int {
@@ -413,17 +436,95 @@ class ChessEngine {
         return bonus
     }
 
-    private fun moveScore(p: Position, m: Move): Int {
+    private val killers = Array(96) { arrayOfNulls<Move>(2) }
+    private val history = HashMap<Int, Int>()
+
+    private fun keyOf(m: Move) = m.from * 64 + m.to
+
+    private fun moveScore(p: Position, m: Move, ply: Int = 0): Int {
         var s = 0
         val victim = p.sq[m.to]
         val attacker = p.sq[m.from]
-        if (victim != '.') s += 1000 + (values[victim.uppercaseChar()] ?: 0) - (values[attacker.uppercaseChar()] ?: 0) / 10
-        if (m.promotion != null) s += 900
-        if (m.flag == 1) s += 1000
-        // checks first: helps find forced mates fast
+        if (victim != '.') s += 4000 + (values[victim.uppercaseChar()] ?: 0) - (values[attacker.uppercaseChar()] ?: 0) / 10
+        if (m.promotion != null) s += 3500
+        if (m.flag == 1) s += 4000
+        // forcing moves first: this is what makes short mates pop out of the search
         val n = Rules.make(p, m)
-        if (Rules.inCheck(n, n.whiteToMove)) s += 700
+        if (Rules.inCheck(n, n.whiteToMove)) {
+            s += 9000
+            val replies = Rules.legalMoves(n).size
+            if (replies == 0) return 1_000_000            // mate now
+            s += (24 - replies.coerceAtMost(24)) * 250    // the more forcing, the better
+        } else {
+            // quiet moves that still shrink the enemy king's box
+            s += (8 - kingEscapeSquares(n, !p.whiteToMove)) * 40
+        }
+        if (ply in killers.indices) {
+            if (killers[ply][0] == m) s += 2500
+            else if (killers[ply][1] == m) s += 1800
+        }
+        s += history[keyOf(m)] ?: 0
         return s
+    }
+
+    private fun storeKiller(ply: Int, m: Move, depth: Int) {
+        if (ply !in killers.indices) return
+        if (killers[ply][0] != m) {
+            killers[ply][1] = killers[ply][0]
+            killers[ply][0] = m
+        }
+        history[keyOf(m)] = (history[keyOf(m)] ?: 0) + depth * depth
+    }
+
+    /**
+     * Dedicated forced-mate solver. The attacker is allowed ONLY checks (or an
+     * immediate mate); the defender may answer with everything. That makes the
+     * tree tiny, so mates far deeper than the normal search can find are proven
+     * in milliseconds - and the line returned is always forced.
+     */
+    fun findForcedMate(p: Position, maxPlies: Int): List<Move>? {
+        for (plies in 1..maxPlies step 2) {
+            val line = ArrayList<Move>()
+            if (mateAttack(p, plies, line)) return line
+            if (stopRequested) return null
+        }
+        return null
+    }
+
+    private fun mateAttack(p: Position, plies: Int, out: MutableList<Move>): Boolean {
+        if (stopRequested || plies <= 0) return false
+        nodes++
+        val moves = Rules.legalMoves(p).sortedByDescending { moveScore(p, it) }
+        for (m in moves) {
+            if (stopRequested) return false
+            val n = Rules.make(p, m)
+            val givesCheck = Rules.inCheck(n, n.whiteToMove)
+            if (!givesCheck) continue                       // only forcing tries
+            if (Rules.legalMoves(n).isEmpty()) {            // checkmate
+                out.clear(); out.add(m); return true
+            }
+            if (plies == 1) continue
+            val sub = ArrayList<Move>()
+            if (mateDefend(n, plies - 1, sub)) {
+                out.clear(); out.add(m); out.addAll(sub); return true
+            }
+        }
+        return false
+    }
+
+    private fun mateDefend(p: Position, plies: Int, out: MutableList<Move>): Boolean {
+        nodes++
+        val replies = Rules.legalMoves(p)
+        if (replies.isEmpty()) return Rules.inCheck(p, p.whiteToMove)
+        var longest: List<Move> = emptyList()
+        for (m in replies) {
+            if (stopRequested) return false
+            val sub = ArrayList<Move>()
+            if (!mateAttack(Rules.make(p, m), plies - 1, sub)) return false
+            if (sub.size + 1 > longest.size) longest = listOf(m) + sub
+        }
+        out.clear(); out.addAll(longest)
+        return true
     }
 
     private fun quiesce(p: Position, alpha0: Int, beta: Int, ply: Int): Int {
@@ -450,16 +551,34 @@ class ChessEngine {
         if (moves.isEmpty()) {
             return if (Rules.inCheck(p, p.whiteToMove)) -MATE + ply else 0
         }
-        if (depth <= 0) return quiesce(p, alpha0, beta, ply)
+        val inCheckHere = Rules.inCheck(p, p.whiteToMove)
+        // check extension: never stop searching in the middle of a forcing sequence
+        val d = if (inCheckHere) depth + 1 else depth
+        if (d <= 0) return quiesce(p, alpha0, beta, ply)
 
-        var alpha = alpha0
-        val ordered = moves.sortedByDescending { moveScore(p, it) }
+        // mate-distance pruning: always prefer the FASTEST mate
+        var alpha = maxOf(alpha0, -MATE + ply)
+        val hiBeta = minOf(beta, MATE - ply - 1)
+        if (alpha >= hiBeta) return alpha
+
+        val ordered = moves.sortedByDescending { moveScore(p, it, ply) }
         var localPv: List<Move> = emptyList()
-        for (m in ordered) {
+        for ((idx, m) in ordered.withIndex()) {
             val childPv = ArrayList<Move>()
-            val score = -search(Rules.make(p, m), depth - 1, -beta, -alpha, ply + 1, childPv)
+            val n = Rules.make(p, m)
+            val forcing = Rules.inCheck(n, n.whiteToMove) || p.sq[m.to] != '.' || m.promotion != null
+            // late-move reduction on quiet moves keeps the search laser-focused on forcing play
+            val nextDepth = if (!forcing && !inCheckHere && idx >= 6 && d >= 3) d - 2 else d - 1
+            var score = -search(n, nextDepth, -hiBeta, -alpha, ply + 1, childPv)
+            if (score > alpha && nextDepth < d - 1) {
+                childPv.clear()
+                score = -search(n, d - 1, -hiBeta, -alpha, ply + 1, childPv)
+            }
             if (stopRequested) break
-            if (score >= beta) return beta
+            if (score >= hiBeta) {
+                if (p.sq[m.to] == '.' && m.promotion == null) storeKiller(ply, m, d)
+                return hiBeta
+            }
             if (score > alpha) {
                 alpha = score
                 localPv = listOf(m) + childPv
@@ -476,10 +595,21 @@ class ChessEngine {
     fun analyze(position: Position, maxDepth: Int = 6, timeLimitMs: Long = 8000, onInfo: ((Info) -> Unit)? = null): Info {
         stopRequested = false
         nodes = 0
+        history.clear()
+        for (k in killers.indices) { killers[k][0] = null; killers[k][1] = null }
         val start = System.currentTimeMillis()
         var bestInfo = Info(null, emptyList(), 0, 0, null, 0)
         val root = position.copy()
         if (Rules.legalMoves(root).isEmpty()) return bestInfo
+
+        // Phase 1 - prove a forced mate with the checks-only solver (mate in 1..4).
+        findForcedMate(root, 7)?.let { line ->
+            val mateIn = (line.size + 1) / 2
+            bestInfo = Info(line.firstOrNull(), line, MATE - line.size, line.size, mateIn, nodes)
+            onInfo?.invoke(bestInfo)
+            return bestInfo
+        }
+        if (stopRequested) return bestInfo
 
         for (depth in 1..maxDepth) {
             val pv = ArrayList<Move>()
