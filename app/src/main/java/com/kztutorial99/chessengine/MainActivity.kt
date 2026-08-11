@@ -21,11 +21,17 @@ class MainActivity : Activity(), ChessBoardView.Listener {
     private lateinit var status: TextView
     private lateinit var line: TextView
     private lateinit var analyzeBtn: Button
+    private lateinit var sideBtn: Button
+    private lateinit var undoBtn: Button
+    private lateinit var engineBtn: Button
 
     private val engine = ChessEngine()
     private val ui = Handler(Looper.getMainLooper())
     private var worker: Thread? = null
     private var liveAnalysis = false
+    private var playerWhite = true
+    private var engineOpponent = false
+    private var engineThinking = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,6 +84,7 @@ class MainActivity : Activity(), ChessBoardView.Listener {
         val reset = styledButton("Reset", Color.rgb(52, 58, 70)) {
             stopAnalysis()
             liveAnalysis = false
+            engineThinking = false
             analyzeBtn.text = "Analyze"
             board.reset()
         }
@@ -86,10 +93,22 @@ class MainActivity : Activity(), ChessBoardView.Listener {
         controls.addView(reset, LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
         controls.addView(analyzeBtn, LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
 
+        val controls2 = LinearLayout(this).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(10), 0, dp(10), dp(4))
+        }
+        undoBtn = styledButton("\u21A9 Undo", Color.rgb(150, 90, 40)) { undoMove() }
+        sideBtn = styledButton("Play: White", Color.rgb(60, 72, 96)) { switchSide() }
+        engineBtn = styledButton("Engine: Off", Color.rgb(52, 58, 70)) { toggleEngineOpponent() }
+        controls2.addView(undoBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
+        controls2.addView(sideBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
+        controls2.addView(engineBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
+
         root.addView(title, LinearLayout.LayoutParams(-1, -2))
         root.addView(boardHolder, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(status, LinearLayout.LayoutParams(-1, -2))
         root.addView(line, LinearLayout.LayoutParams(-1, -2))
+        root.addView(controls2, LinearLayout.LayoutParams(-1, -2))
         root.addView(controls, LinearLayout.LayoutParams(-1, -2))
         setContentView(root)
 
@@ -110,6 +129,58 @@ class MainActivity : Activity(), ChessBoardView.Listener {
             }
             setOnClickListener { onClick() }
         }
+
+    // --- side / undo / engine opponent -----------------------------------------
+
+    /** Switch the colour you play: flips the board and hands the other side to the engine. */
+    private fun switchSide() {
+        stopAnalysis()
+        playerWhite = !playerWhite
+        board.flipped = !playerWhite
+        sideBtn.text = if (playerWhite) "Play: White" else "Play: Black"
+        updateStatus()
+        if (liveAnalysis) startAnalysis() else maybeEngineMove()
+    }
+
+    /** Takes back your move (plus the engine's reply when the engine is playing). */
+    private fun undoMove() {
+        stopAnalysis()
+        engineThinking = false
+        if (!board.undo()) return
+        if (engineOpponent) board.undo()
+        updateStatus()
+        if (liveAnalysis) startAnalysis()
+    }
+
+    private fun toggleEngineOpponent() {
+        engineOpponent = !engineOpponent
+        engineBtn.text = if (engineOpponent) "Engine: On" else "Engine: Off"
+        engineBtn.background = (engineBtn.background as GradientDrawable).apply {
+            setColor(if (engineOpponent) Color.rgb(160, 50, 60) else Color.rgb(52, 58, 70))
+        }
+        if (engineOpponent) maybeEngineMove()
+    }
+
+    /** Lets the engine answer when it is its turn. It always plays the most forcing line. */
+    private fun maybeEngineMove() {
+        if (!engineOpponent || engineThinking || liveAnalysis) return
+        val p = board.position
+        if (p.whiteToMove == playerWhite) return
+        if (Rules.legalMoves(p).isEmpty()) return
+        engineThinking = true
+        status.text = "Engine thinking\u2026"
+        val snapshot = p.copy()
+        worker = Thread {
+            val info = engine.analyze(snapshot, maxDepth = 5, timeLimitMs = 4000)
+            ui.post {
+                engineThinking = false
+                val best = info.best
+                if (best != null && board.position.toFen() == snapshot.toFen()) {
+                    board.playMove(best)
+                } else updateStatus()
+            }
+        }.also { it.isDaemon = true; it.start() }
+    }
 
     // --- analysis -------------------------------------------------------------
 
@@ -171,7 +242,11 @@ class MainActivity : Activity(), ChessBoardView.Listener {
 
     override fun onPositionChanged(position: Position) {
         updateStatus()
-        if (liveAnalysis) startAnalysis() else line.text = ""
+        undoBtn.isEnabled = board.canUndo
+        if (liveAnalysis) startAnalysis() else {
+            line.text = ""
+            maybeEngineMove()
+        }
     }
 
     private fun updateStatus() {
