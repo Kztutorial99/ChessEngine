@@ -120,11 +120,20 @@ class ChessBoardView(context: Context) : View(context) {
             }
         }
 
+        // The king that is IN CHECK gets a loud red square so you can see it instantly.
         if (Rules.inCheck(position, position.whiteToMove)) {
             val k = Rules.kingSquare(position, position.whiteToMove).let { if (it >= 0) dsp(it) else it }
             if (k >= 0) {
-                paint.color = Color.argb(120, 220, 50, 50)
-                canvas.drawRect(left + (k % 8) * sq, top + (k / 8) * sq, left + (k % 8 + 1) * sq, top + (k / 8 + 1) * sq, paint)
+                val x0 = left + (k % 8) * sq
+                val y0 = top + (k / 8) * sq
+                paint.style = Paint.Style.FILL
+                paint.color = Color.rgb(215, 38, 38)
+                canvas.drawRect(x0, y0, x0 + sq, y0 + sq, paint)
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = sq * .08f
+                paint.color = Color.rgb(255, 120, 120)
+                canvas.drawRect(x0 + sq * .04f, y0 + sq * .04f, x0 + sq * .96f, y0 + sq * .96f, paint)
+                paint.style = Paint.Style.FILL
             }
         }
 
@@ -158,11 +167,8 @@ class ChessBoardView(context: Context) : View(context) {
         }
         if (dragging && selected >= 0) drawPiece(canvas, position.sq[selected], dragX, dragY, sq)
 
-        // engine arrows: main line strong, follow-up faded
-        hint?.let { drawArrow(canvas, left, top, sq, dsp(it.from), dsp(it.to), Color.argb(225, 40, 190, 90), sq * .11f) }
-        if (hintPv.size > 1) {
-            drawArrow(canvas, left, top, sq, dsp(hintPv[1].from), dsp(hintPv[1].to), Color.argb(120, 90, 160, 255), sq * .07f)
-        }
+        // Exactly ONE engine arrow: the single best move. No second/faded arrow.
+        hint?.let { drawArrow(canvas, left, top, sq, dsp(it.from), dsp(it.to), Color.argb(235, 40, 190, 90), sq * .12f) }
 
         pendingPromotion?.let { drawPromotionPicker(canvas, left, top, sq, it) }
     }
