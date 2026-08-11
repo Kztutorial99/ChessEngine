@@ -31,9 +31,9 @@ class MainActivity : Activity(), ChessBoardView.Listener {
     private var liveAnalysis = false
     private var playerWhite = true
     private var extremeMode = false
-    /** EXTREME think time per analysis: 1s / 3s / 5s. */
-    private var thinkMs = 3000L
-    private lateinit var timeBtn: Button
+    /** Fixed think budgets: no user-selected duration, the engine simply analyses properly. */
+    private val normalMs = 6000L
+    private val extremeMs = 15000L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -90,9 +90,7 @@ class MainActivity : Activity(), ChessBoardView.Listener {
             board.reset()
         }
         analyzeBtn = styledButton("Analyze", Color.rgb(38, 140, 86)) { toggleAnalysis() }
-        timeBtn = styledButton("\u23F1 3s", Color.rgb(60, 72, 96)) { cycleThinkTime() }
 
-        controls.addView(timeBtn, LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
         controls.addView(reset, LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
         controls.addView(analyzeBtn, LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
 
@@ -136,17 +134,6 @@ class MainActivity : Activity(), ChessBoardView.Listener {
             }
             setOnClickListener { onClick() }
         }
-
-    /** 1s = fast, 5s = most accurate mate hunting. */
-    private fun cycleThinkTime() {
-        thinkMs = when (thinkMs) {
-            1000L -> 3000L
-            3000L -> 5000L
-            else -> 1000L
-        }
-        timeBtn.text = "\u23F1 ${thinkMs / 1000}s"
-        if (liveAnalysis) startAnalysis()
-    }
 
     // --- side / undo / engine opponent -----------------------------------------
 
@@ -219,9 +206,9 @@ class MainActivity : Activity(), ChessBoardView.Listener {
             return
         }
         val mover = if (playerWhite) "White" else "Black"
-        status.text = if (extremeMode) "\u26A1 EXTREME mate hunt (${thinkMs / 1000}s)\u2026" else "Analyzing for $mover\u2026"
-        val depth = if (extremeMode) 7 else 5
-        val budget = if (extremeMode) thinkMs else 6000L
+        status.text = if (extremeMode) "\u26A1 EXTREME deep analysis\u2026" else "Analyzing for $mover\u2026"
+        val depth = if (extremeMode) 8 else 6
+        val budget = if (extremeMode) extremeMs else normalMs
         worker = Thread {
             engine.analyze(snapshot, maxDepth = depth, timeLimitMs = budget) { info ->
                 ui.post {
