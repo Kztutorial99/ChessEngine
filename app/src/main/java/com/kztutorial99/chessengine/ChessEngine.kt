@@ -330,6 +330,11 @@ class ChessEngine {
 
     private var nodes = 0L
 
+    /** Hard wall-clock deadline; every search phase respects it so the UI never freezes. */
+    @Volatile
+    var deadlineMs: Long = Long.MAX_VALUE
+    private fun timeUp() = System.currentTimeMillis() >= deadlineMs
+
     private val values = mapOf('P' to 100, 'N' to 320, 'B' to 335, 'R' to 500, 'Q' to 950, 'K' to 0)
 
     private val pawnPst = intArrayOf(
@@ -539,13 +544,13 @@ class ChessEngine {
         for (plies in 1..maxPlies step 2) {
             val line = ArrayList<Move>()
             if (mateAttack(p, plies, line)) return line
-            if (stopRequested) return null
+            if (stopRequested || timeUp()) return null
         }
         return null
     }
 
     private fun mateAttack(p: Position, plies: Int, out: MutableList<Move>): Boolean {
-        if (stopRequested || plies <= 0) return false
+        if (stopRequested || timeUp() || plies <= 0) return false
         nodes++
         val moves = Rules.legalMoves(p).sortedByDescending { moveScore(p, it) }
         for (m in moves) {
@@ -567,11 +572,12 @@ class ChessEngine {
 
     private fun mateDefend(p: Position, plies: Int, out: MutableList<Move>): Boolean {
         nodes++
+        if (stopRequested || timeUp()) return false
         val replies = Rules.legalMoves(p)
         if (replies.isEmpty()) return Rules.inCheck(p, p.whiteToMove)
         var longest: List<Move> = emptyList()
         for (m in replies) {
-            if (stopRequested) return false
+            if (stopRequested || timeUp()) return false
             val sub = ArrayList<Move>()
             if (!mateAttack(Rules.make(p, m), plies - 1, sub)) return false
             if (sub.size + 1 > longest.size) longest = listOf(m) + sub
@@ -598,7 +604,7 @@ class ChessEngine {
     }
 
     private fun search(p: Position, depth: Int, alpha0: Int, beta: Int, ply: Int, pvOut: MutableList<Move>): Int {
-        if (stopRequested) return 0
+        if (stopRequested || timeUp()) return 0
         nodes++
         val moves = Rules.legalMoves(p)
         if (moves.isEmpty()) {
@@ -670,15 +676,28 @@ class ChessEngine {
         history.clear()
         for (k in killers.indices) { killers[k][0] = null; killers[k][1] = null }
         val start = System.currentTimeMillis()
+        deadlineMs = start + timeLimitMs
         var bestInfo = Info(null, emptyList(), 0, 0, null, 0)
         val root = position.copy()
-        if (Rules.legalMoves(root).isEmpty()) return bestInfo
+        val rootMoves = Rules.legalMoves(root)
+        if (rootMoves.isEmpty()) return bestInfo
 
-        // Phase 1 - prove a forced mate with the checks-only solver.
-        // Classic: mate in 1..4. EXTREME: mate in 1..7, proven and forced.
-        findForcedMate(root, if (extreme) 13 else 7)?.let { line ->
-            val mateIn = (line.size + 1) / 2
-            bestInfo = Info(line.firstOrNull(), line, MATE - line.size, line.size, mateIn, nodes)
+        // Instant suggestion: the board must ALWAYS show one arrow, even while the
+        // deep mate hunt is still thinking. This is what removes the "stuck, no
+        // arrow" feeling on slow positions.
+        val quick = rootMoves.maxByOrNull { moveScore(root, it) } ?: rootMoves.first()
+        bestInfo = Info(quick, listOf(quick), 0, 1, null, nodes)
+        onInfo?.invoke(bestInfo)
+
+        // Phase 1 - prove the FASTEST forced mate with the checks-only solver.
+        // It gets a slice of the budget so the normal search always gets a turn.
+        val mateBudget = start + (timeLimitMs * 6 / 10).coerceAtLeast(200L)
+        deadlineMs = mateBudget
+        val mateLine = findForcedMate(root, if (extreme) 13 else 7)
+        deadlineMs = start + timeLimitMs
+        if (mateLine != null) {
+            val mateIn = (mateLine.size + 1) / 2
+            bestInfo = Info(mateLine.firstOrNull(), mateLine, MATE - mateLine.size, mateLine.size, mateIn, nodes)
             onInfo?.invoke(bestInfo)
             return bestInfo
         }
@@ -686,9 +705,11 @@ class ChessEngine {
 
         val topDepth = if (extreme) maxDepth + 2 else maxDepth
         for (depth in 1..topDepth) {
+            if (timeUp()) break
             val pv = ArrayList<Move>()
             val score = search(root, depth, -MATE * 2, MATE * 2, 0, pv)
             if (stopRequested) break
+            if (pv.isEmpty()) break
             val mateIn = if (abs(score) > MATE - 200) {
                 val plies = MATE - abs(score)
                 val moves = (plies + 1) / 2
@@ -697,20 +718,17 @@ class ChessEngine {
             bestInfo = Info(pv.firstOrNull(), pv.toList(), score, depth, mateIn, nodes)
             onInfo?.invoke(bestInfo)
             if (mateIn != null && mateIn > 0) break
-            if (System.currentTimeMillis() - start > timeLimitMs) break
+            if (timeUp()) break
         }
 
-        // Phase 3 (EXTREME only) - no mate yet, so pick the move that puts the
-        // enemy king under the heaviest unavoidable mating pressure.
-        if (extreme && !stopRequested && bestInfo.mateIn == null) {
-            val candidates = Rules.legalMoves(root)
-                .sortedByDescending { moveScore(root, it) }
-                .take(6)
+        // Phase 3 (EXTREME only) - no proven mate yet, so pick the move that puts
+        // the enemy king under the heaviest unavoidable mating pressure.
+        if (extreme && !stopRequested && bestInfo.mateIn == null && !timeUp()) {
+            val candidates = rootMoves.sortedByDescending { moveScore(root, it) }.take(6)
             var bestMove = bestInfo.best
             var bestThreat = bestInfo.best?.let { mateThreat(root, it, 5) } ?: -1
             for (m in candidates) {
-                if (stopRequested) break
-                if (System.currentTimeMillis() - start > timeLimitMs * 2) break
+                if (stopRequested || timeUp()) break
                 val t = mateThreat(root, m, 5)
                 if (t > bestThreat) { bestThreat = t; bestMove = m }
             }
@@ -719,9 +737,10 @@ class ChessEngine {
                 onInfo?.invoke(bestInfo)
             }
         }
+        deadlineMs = Long.MAX_VALUE
         return bestInfo
     }
 
 
-    fun stop() { stopRequested = true }
+    fun stop() { stopRequested = true; deadlineMs = 0 }
 }
